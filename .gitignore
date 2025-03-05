@@ -79,6 +79,7 @@ data/
 derivatives/
 leadfield/
 figures/
+results/
 
 # But include the README files in these directories
 !data/README.md
