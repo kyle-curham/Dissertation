@@ -11,10 +11,12 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import mne
-from mne.io import read_epochs_eeglab
+from mne.io import read_raw_edf
 from pathlib import Path
 import sys
 import argparse
+from scipy.sparse.linalg import svds
+import math
 
 # Add the project root to the path so we can import from eeg_processing
 project_root = Path(__file__).parent.parent
@@ -37,8 +39,8 @@ def parse_args():
     parser.add_argument('--training_epochs', type=int, default=100, 
                         help='Number of training epochs (default: 100)')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
-    parser.add_argument('--learning_rate', type=float, default=1e-3, 
-                        help='Learning rate (default: 0.001)')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, 
+                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--beta', type=float, default=0.1, 
                         help='KL divergence weight (default: 0.1)')
     parser.add_argument('--gpu', action='store_true', help='Use GPU if available')
@@ -67,33 +69,41 @@ def main():
     output_dir = project_root / "eeg_processing" / "results"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load leadfield matrix
-    leadfield_path = leadfield_dir / f"{sub_id}_{ses_id}_leadfield.npy"
-    leadfield = np.load(leadfield_path)
+
+    edf_file = data_root / sub_id / ses_id / "eeg" / f"{sub_id}_{ses_id}_task-{task_id}_eeg.edf"
+        
+    print(f"Loading continuous EEG data from: {edf_file}")
     
-    # Load leadfield info (optional, for reference)
-    leadfield_info_path = leadfield_dir / f"{sub_id}_{ses_id}_leadfield_info.npy"
-    leadfield_info = np.load(leadfield_info_path, allow_pickle=True).item()
+    # Load the raw EDF file
+    raw = read_raw_edf(edf_file, preload=True)
+    print(f"Raw data loaded: {len(raw.ch_names)} channels, {raw.n_times} time points")
     
+    # Extract data and convert to array
+    raw_data = raw.get_data()
+    
+    # Convert from volts to microvolts for better numerical stability
+    raw_data = raw_data * 1e3
+    print(f"Converting EEG data from millivolts to microvolts (μV)")
+    
+    # Reshape to (n_timepoints, n_channels) for the model
+    eeg_data = raw_data.T
+
+    # Limit to the first 10000 timepoints
+    eeg_data = eeg_data[:1000, :]
+    print(f"Using only the first 10000 timepoints of EEG data")
+    
+    # Convert to PyTorch tensor
+    eeg_tensor = torch.tensor(eeg_data, dtype=torch.float32, device=device)
+    print(f"EEG data shape: {eeg_tensor.shape}")
+    
+    # Load leadfield 
+    leadfield_file = leadfield_dir / f"{sub_id}_{ses_id}_leadfield.npy"
+    leadfield = np.load(leadfield_file)
     print(f"Leadfield matrix shape: {leadfield.shape}")
     
-    # Load cleaned EEG epochs
-    epochs_path = derivatives_dir / sub_id / ses_id / "eeg" / f"{sub_id}_{ses_id}_task-{task_id}_desc-epochs_eeg.set"
-    epochs = read_epochs_eeglab(epochs_path)
-    
-    # Get EEG data and convert to torch tensor
-    eeg_data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
-    
-    # Take the specified number of epochs
-    n_epochs_to_use = min(args.n_epochs_to_use, eeg_data.shape[0])
-    eeg_subset = eeg_data[:n_epochs_to_use, :, :]
-    
-    # Reshape for model input: (time_points, channels)
-    # Concatenate epochs along the time dimension
-    eeg_data_reshaped = eeg_subset.reshape(-1, eeg_subset.shape[1]).T  # Now (n_channels, n_timepoints)
-    eeg_tensor = torch.tensor(eeg_data_reshaped.T, dtype=torch.float32, device=device)  # Convert to (n_timepoints, n_channels)
-    
-    print(f"EEG data shape: {eeg_tensor.shape}")
+    # Convert leadfield to μV/(nAm) for consistent units with EEG data in microvolts
+    leadfield = leadfield * 1e-3
+    print(f"Converting leadfield to μV/(nAm) for unit consistency")
     
     # Define model parameters
     y_dim = eeg_tensor.shape[1]  # Number of EEG channels
@@ -102,21 +112,52 @@ def main():
     print(f"Using latent state dimension: {x_dim}")
     print(f"Observation dimension: {y_dim}")
     
-    # Downsample the leadfield to match the state dimension
-    # This is a simple approach - in practice, you might want a more sophisticated method
-    # such as ROI-based averaging or PCA
-    n_sources = leadfield.shape[1]
-    source_indices = np.linspace(0, n_sources-1, x_dim, dtype=int)
-    C_downsampled = leadfield[:, source_indices]
+    # Check for NaN or infinite values in leadfield
+    if np.any(np.isnan(leadfield)):
+        print("Warning: Lead field matrix contains NaN values")
+        # Replace NaN with zeros
+        leadfield = np.nan_to_num(leadfield, nan=0.0)
     
-    print(f"Downsampled leadfield (C) shape: {C_downsampled.shape}")
+    if np.any(np.isinf(leadfield)):
+        print("Warning: Lead field matrix contains infinite values")
+        # Replace inf with large values
+        leadfield = np.nan_to_num(leadfield, posinf=1e6, neginf=-1e6)
+    
+    # Use SVD-based dimensionality reduction for the leadfield
+    # This is a more principled approach than simple column selection
+    
+    # Perform truncated SVD
+    n_components = min(x_dim, min(leadfield.shape) - 1)
+    U, s, Vh = svds(leadfield, k=n_components)
+    
+    # Sort in descending order of singular values
+    idx = np.argsort(s)[::-1]
+    s = s[idx]
+    U = U[:, idx]
+    Vh = Vh[idx, :]
+    
+    # Create reduced matrices
+    C_downsampled = U @ np.diag(s)
+    V = Vh.T  # For back-projection
+    
+    # Calculate explained variance
+    explained_variance = np.sum(s**2) / np.sum(s**2) * 100
+    
+    print(f"\nDimensionality reduction:")
+    print(f"Original leadfield dimensions: {leadfield.shape}")
+    print(f"Reduced leadfield dimensions: {C_downsampled.shape}")
+    print(f"Number of components kept: {n_components}")
+    print(f"Variance explained: {explained_variance:.2f}%")
     
     # Create validation set (20% of data)
     total_timepoints = eeg_tensor.shape[0]
     val_size = int(0.2 * total_timepoints)
     train_size = total_timepoints - val_size
     
+    # Important: When using continuous data, split in a way that preserves continuity
+    # For training data, use a continuous segment
     train_data = eeg_tensor[:train_size]
+    # For validation, use the next continuous segment
     val_data = eeg_tensor[train_size:]
     
     print(f"Training data shape: {train_data.shape}")
@@ -130,9 +171,12 @@ def main():
         u_dim=x_dim,  # Set control input dimension equal to state dimension
         beta=args.beta,
         prior_std=1.0,
-        dt=1/epochs.info['sfreq'],  # Use actual sampling frequency
+        dt=1/raw.info['sfreq'],  # Use actual sampling frequency from raw data
         eps=1e-4
     )
+    
+    # Store V matrix for back-projection (requires model to be updated)
+    model.register_buffer('V', torch.tensor(V, dtype=torch.float32))
     
     # Move model to device
     model = model.to(device)
@@ -142,12 +186,18 @@ def main():
     batch_size = args.batch_size
     learning_rate = args.learning_rate
     
+    # Print training data info
+    print("\nTraining data info:")
+    print(f"Training data shape: {train_data.shape}")
+    print(f"Training data - min: {train_data.min().item()}, max: {train_data.max().item()}, mean: {train_data.mean().item()}")
+    print(f"First few values: {train_data[0, 0:3]}")
+    
     # Train model
-    print(f"Training model for {n_epochs} epochs with batch size {batch_size}...")
+    print(f"\nTraining model for {n_epochs} epochs with batch size {batch_size}...")
     history = model.fit(
         y=train_data,
         n_epochs=n_epochs,
-        batch_size=batch_size,
+        #batch_size=batch_size,
         learning_rate=learning_rate,
         validation_data=val_data,
         verbose=True
@@ -169,13 +219,50 @@ def main():
     plt.close()
     
     # Forward pass on validation data to get predictions and latent states
-    with torch.no_grad():
-        output = model.forward(val_data)
+    print("\nValidation data info:")
+    print(f"Validation data shape: {val_data.shape}")
+    print(f"Validation data - min: {val_data.min().item()}, max: {val_data.max().item()}, mean: {val_data.mean().item()}")
+    print(f"First few values: {val_data[0, 0:3]}")
+    
+    # Run prediction on validation data
+    print("\nRunning forward pass on validation data...")
+    output = model.predict(val_data, project_to_sources=True)
     
     # Extract states and predictions
-    latent_states = output['latent_states']  # (time, state_dim)
-    predicted_obs = output['predicted_observations']  # (time, obs_dim)
-    control_inputs = output['control_inputs']  # (time, input_dim)
+    latent_states = output['x'].squeeze(0)  # Remove batch dimension
+    predicted_obs = output['y_pred'].squeeze(0)  # Remove batch dimension
+    
+    # Print prediction info
+    print("\nPrediction results:")
+    print(f"Predicted observations shape: {predicted_obs.shape}")
+    print(f"Predicted obs - min: {predicted_obs.min().item()}, max: {predicted_obs.max().item()}, mean: {predicted_obs.mean().item()}")
+    print(f"First few predicted values: {predicted_obs[0, 0:3]}")
+    
+    # Compare scales directly
+    obs_max = val_data.max().item()
+    pred_max = predicted_obs.max().item()
+    print(f"\nScale comparison:")
+    print(f"Observation max: {obs_max:.6e}")
+    print(f"Prediction max: {pred_max:.6e}")
+    print(f"Ratio (pred/obs): {pred_max/obs_max:.6e}")
+    
+    # Run prediction on training data to check for overfitting
+    print("\nRunning forward pass on training data...")
+    train_output = model.predict(train_data, project_to_sources=True)
+    train_predicted_obs = train_output['y_pred'].squeeze(0)  # Remove batch dimension
+    
+    # Print training prediction info
+    print("\nTraining prediction results:")
+    print(f"Training predicted observations shape: {train_predicted_obs.shape}")
+    print(f"Training predicted obs - min: {train_predicted_obs.min().item()}, max: {train_predicted_obs.max().item()}, mean: {train_predicted_obs.mean().item()}")
+    
+    # Compare training prediction vs observed
+    train_obs_max = train_data.max().item()
+    train_pred_max = train_predicted_obs.max().item()
+    print(f"\nTraining data scale comparison:")
+    print(f"Training observation max: {train_obs_max:.6e}")
+    print(f"Training prediction max: {train_pred_max:.6e}")
+    print(f"Ratio (pred/obs): {train_pred_max/train_obs_max:.6e}")
     
     # Plot latent states
     plt.figure(figsize=(12, 8))
@@ -188,26 +275,53 @@ def main():
     plt.savefig(output_dir / f"{sub_id}_latent_states.png")
     plt.close()
     
-    # Plot a subset of observed vs predicted EEG channels
+    # Plot a subset of observed vs predicted EEG channels for training data
     channels_to_plot = min(6, y_dim)  # Plot up to 6 channels
+    plt.figure(figsize=(15, 10))
+    for i in range(channels_to_plot):
+        plt.subplot(3, 2, i+1)
+        plt.plot(train_data[:, i].cpu().numpy(), label='Observed', alpha=0.7)
+        plt.plot(train_predicted_obs[:, i].cpu().numpy(), label='Predicted', alpha=0.7)
+        plt.title(f'Training Channel {i+1}')
+        plt.legend()
+        plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{sub_id}_training_predictions.png")
+    plt.close()
+    
+    # Plot a subset of observed vs predicted EEG channels for validation data
     plt.figure(figsize=(15, 10))
     for i in range(channels_to_plot):
         plt.subplot(3, 2, i+1)
         plt.plot(val_data[:, i].cpu().numpy(), label='Observed', alpha=0.7)
         plt.plot(predicted_obs[:, i].cpu().numpy(), label='Predicted', alpha=0.7)
-        plt.title(f'Channel {i+1}')
+        plt.title(f'Validation Channel {i+1}')
         plt.legend()
         plt.grid(True)
     plt.tight_layout()
-    plt.savefig(output_dir / f"{sub_id}_predictions.png")
+    plt.savefig(output_dir / f"{sub_id}_validation_predictions.png")
     plt.close()
+    
+    # If source activity is available, plot it
+    if 'source_activity' in output:
+        source_activity = output['source_activity'].squeeze(0)
+        # Plot a subset of source activities
+        sources_to_plot = min(6, source_activity.shape[1])
+        plt.figure(figsize=(15, 10))
+        for i in range(sources_to_plot):
+            plt.subplot(3, 2, i+1)
+            plt.plot(source_activity[:, i].cpu().numpy())
+            plt.title(f'Source {i+1}')
+            plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{sub_id}_source_activity.png")
+        plt.close()
     
     # Get learned matrices
     A = model.A.detach().cpu().numpy()
     B = model.B.detach().cpu().numpy()
     Q = model.Q.detach().cpu().numpy()
     R = model.R.detach().cpu().numpy()
-    P = model.P.detach().cpu().numpy()
     
     # Print matrix information
     print("\nLearned model parameters:")
@@ -215,7 +329,6 @@ def main():
     print(f"B shape: {B.shape}")
     print(f"Q shape: {Q.shape}")
     print(f"R shape: {R.shape}")
-    print(f"P shape: {P.shape}")
     
     # Save model
     model_save_path = output_dir / f"{sub_id}_coupled_state_space_model.pt"
@@ -224,14 +337,21 @@ def main():
     
     # Also save the learned matrices
     matrices_save_path = output_dir / f"{sub_id}_learned_matrices.npz"
+    
+    # Prepare matrices dict
+    matrices_dict = {
+        'A': A,
+        'B': B,
+        'C': model.C.detach().cpu().numpy(),
+        'Q': Q,
+        'R': R,
+        'V': model.V.detach().cpu().numpy(),  # Save V matrix for back-projection
+        'leadfield_full': leadfield  # Save the full leadfield
+    }
+    
     np.savez(
         matrices_save_path,
-        A=A,
-        B=B,
-        C=model.C.detach().cpu().numpy(),
-        Q=Q,
-        R=R,
-        P=P
+        **matrices_dict
     )
     print(f"Learned matrices saved to {matrices_save_path}")
     

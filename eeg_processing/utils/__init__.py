@@ -1,37 +1,20 @@
 """
-EEG Processing Utilities
-
-This module contains numerical tools for state-space modeling and analysis.
+Utility functions for EEG processing and visualization.
+This package contains helper functions for data processing, visualization, and analysis.
 """
 
-# Numerical differentiation functions
-from .numerical_differentiation import (
-    central_difference,
-    savitzky_golay_derivative,
-    discrete_to_continuous,
-    continuous_to_discrete,
-    estimate_derivatives
-)
-
-# Numerical stability functions
-from .numerical_stability import (
-    enforce_cholesky_structure,
-    ensure_positive_definite,
-    stabilize_covariance,
-    safe_cholesky
+from eeg_processing.utils.plotting import (
+    plot_training_results,
+    plot_matrix_analysis,
+    plot_training_history,
+    plot_prediction_comparison,
+    plot_latent_dynamics
 )
 
 __all__ = [
-    # Differentiation
-    'central_difference',
-    'savitzky_golay_derivative',
-    'discrete_to_continuous',
-    'continuous_to_discrete',
-    'estimate_derivatives',
-    
-    # Stability
-    'enforce_cholesky_structure',
-    'ensure_positive_definite', 
-    'stabilize_covariance',
-    'safe_cholesky'
+    'plot_training_results',
+    'plot_matrix_analysis',
+    'plot_training_history',
+    'plot_prediction_comparison',
+    'plot_latent_dynamics'
 ] 

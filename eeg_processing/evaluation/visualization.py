@@ -441,41 +441,41 @@ def visualize_coupled_model(
     A = model.A
     C = model.C
     
-    # Sample states and inputs
+    # Use the model's predict method to get predictions
+    # This ensures we're using the same pipeline as during training
     with torch.no_grad():
-        x_samples, u_samples = model.sample_augmented_state(data, n_samples=n_samples)
-    
-    # Compute mean states and inputs
-    x_mean = x_samples.mean(dim=0)
-    u_mean = u_samples.mean(dim=0)
-    
-    # Compute standard deviations
-    x_std = x_samples.std(dim=0)
-    u_std = u_samples.std(dim=0)
-    
-    # Compute reconstruction
-    reconstruction = C @ x_mean.T
-    reconstruction = reconstruction.T
+        # First, get a single prediction to extract latent states
+        predictions = model.predict(data, project_to_sources=True)
+        x = predictions['x'].squeeze(0)  # Remove batch dimension
+        y_pred = predictions['y_pred'].squeeze(0)  # EEG space predictions
+        
+        # If source activity is available, get it too
+        source_activity = None
+        if 'source_activity' in predictions:
+            source_activity = predictions['source_activity'].squeeze(0)
     
     # Plot states
     fig1 = plot_state_trajectories(
-        x_mean,
+        x,
         title="Latent State Trajectories",
         save_path=os.path.join(save_dir, "state_trajectories.png") if save_dir else None
     )
     
-    # Plot inputs
-    fig2 = plot_state_trajectories(
-        u_mean,
-        title="Latent Input Trajectories",
-        save_path=os.path.join(save_dir, "input_trajectories.png") if save_dir else None
-    )
+    # If we have source activity, plot that too
+    if source_activity is not None:
+        # Limit to a reasonable number of sources
+        max_sources_to_plot = min(10, source_activity.shape[1])
+        fig_sources = plot_state_trajectories(
+            source_activity[:, :max_sources_to_plot],
+            title="Estimated Source Activity (Top 10 Sources)",
+            save_path=os.path.join(save_dir, "source_activity.png") if save_dir else None
+        )
     
-    # Plot reconstruction
+    # Plot reconstruction - comparing observed EEG with predicted EEG
     fig3 = plot_reconstruction(
         data.cpu(), 
-        reconstruction.cpu(),
-        title="Original vs Reconstructed Data",
+        y_pred.cpu(),
+        title="Observed vs Predicted EEG",
         save_path=os.path.join(save_dir, "reconstruction.png") if save_dir else None
     )
     
@@ -495,32 +495,27 @@ def visualize_coupled_model(
     )
     
     # Plot state uncertainty
-    fig6, axs = plt.subplots(min(4, x_mean.shape[1]), 1, figsize=(12, 8), sharex=True)
-    if min(4, x_mean.shape[1]) == 1:
+    states_to_plot = min(4, x.shape[1])
+    fig6, axs = plt.subplots(states_to_plot, 1, figsize=(12, 8), sharex=True)
+    if states_to_plot == 1:
         axs = [axs]
     
-    for i in range(min(4, x_mean.shape[1])):
-        axs[i].plot(x_mean[:, i].cpu().numpy())
-        axs[i].fill_between(
-            np.arange(len(x_mean)),
-            (x_mean[:, i] - x_std[:, i]).cpu().numpy(),
-            (x_mean[:, i] + x_std[:, i]).cpu().numpy(),
-            alpha=0.3
-        )
+    for i in range(states_to_plot):
+        axs[i].plot(x[:, i].cpu().numpy())
+        # Without multiple samples, we can't show uncertainty
         axs[i].set_ylabel(f"State {i+1}")
-        axs[i].grid(True)
     
-    plt.suptitle("State Trajectories with Uncertainty")
-    plt.xlabel("Time")
+    axs[-1].set_xlabel("Time Step")
+    plt.suptitle("Latent State Trajectories (Top 4 States)")
     plt.tight_layout()
     
     if save_dir:
-        plt.savefig(os.path.join(save_dir, "state_uncertainty.png"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join(save_dir, "state_uncertainty.png"), dpi=300)
     
     # Return all figures
     return {
         "state_trajectories": fig1,
-        "input_trajectories": fig2,
+        "source_activity": fig_sources if source_activity is not None else None,
         "reconstruction": fig3,
         "system_matrices": fig4,
         "eigenvalue_analysis": fig5,
